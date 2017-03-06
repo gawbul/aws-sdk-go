@@ -175,6 +175,9 @@ type UploadInput struct {
 	// The type of storage to use for the object. Defaults to 'STANDARD'.
 	StorageClass *string `location:"header" locationName:"x-amz-storage-class" type:"string"`
 
+	// The tag-set for the object. The tag-set must be encoded as URL Query parameters
+	Tagging *string `location:"header" locationName:"x-amz-tagging" type:"string"`
+
 	// If the bucket is configured as a website, redirects requests for this object
 	// to another object in the same bucket or to an external URL. Amazon S3 stores
 	// the value of this header in the object metadata.
@@ -238,7 +241,7 @@ type Uploader struct {
 //
 // Example:
 //     // The session the S3 Uploader will use
-//     sess, err := session.NewSession()
+//     sess := session.Must(session.NewSession())
 //
 //     // Create an uploader with the session and default options
 //     uploader := s3manager.NewUploader(sess)
@@ -269,7 +272,7 @@ func NewUploader(c client.ConfigProvider, options ...func(*Uploader)) *Uploader 
 //
 // Example:
 //     // The session the S3 Uploader will use
-//     sess, err := session.NewSession()
+//     sess := session.Must(session.NewSession())
 //
 //     // S3 service client the Upload manager will use.
 //     s3Svc := s3.New(sess)
@@ -354,15 +357,15 @@ func (u *uploader) upload() (*UploadOutput, error) {
 	}
 
 	// Do one read to determine if we have more than one part
-	buf, err := u.nextReader()
-	if err == io.EOF || err == io.ErrUnexpectedEOF { // single part
-		return u.singlePart(buf)
+	reader, _, err := u.nextReader()
+	if err == io.EOF { // single part
+		return u.singlePart(reader)
 	} else if err != nil {
 		return nil, awserr.New("ReadRequestBody", "read upload data failed", err)
 	}
 
 	mu := multiuploader{uploader: u}
-	return mu.upload(buf)
+	return mu.upload(reader)
 }
 
 // init will initialize all default options.
@@ -408,36 +411,47 @@ func (u *uploader) initSize() {
 // This operation increases the shared u.readerPos counter, but note that it
 // does not need to be wrapped in a mutex because nextReader is only called
 // from the main thread.
-func (u *uploader) nextReader() (io.ReadSeeker, error) {
+func (u *uploader) nextReader() (io.ReadSeeker, int, error) {
+	type readerAtSeeker interface {
+		io.ReaderAt
+		io.ReadSeeker
+	}
 	switch r := u.in.Body.(type) {
-	case io.ReaderAt:
+	case readerAtSeeker:
 		var err error
 
 		n := u.ctx.PartSize
 		if u.totalSize >= 0 {
 			bytesLeft := u.totalSize - u.readerPos
 
-			if bytesLeft == 0 {
+			if bytesLeft <= u.ctx.PartSize {
 				err = io.EOF
-				n = bytesLeft
-			} else if bytesLeft <= u.ctx.PartSize {
-				err = io.ErrUnexpectedEOF
 				n = bytesLeft
 			}
 		}
 
-		buf := io.NewSectionReader(r, u.readerPos, n)
+		reader := io.NewSectionReader(r, u.readerPos, n)
 		u.readerPos += n
 
-		return buf, err
+		return reader, int(n), err
 
 	default:
-		packet := make([]byte, u.ctx.PartSize)
-		n, err := io.ReadFull(u.in.Body, packet)
+		part := make([]byte, u.ctx.PartSize)
+		n, err := readFillBuf(r, part)
 		u.readerPos += int64(n)
 
-		return bytes.NewReader(packet[0:n]), err
+		return bytes.NewReader(part[0:n]), n, err
 	}
+}
+
+func readFillBuf(r io.Reader, b []byte) (offset int, err error) {
+	for offset < len(b) && err == nil {
+		var n int
+		n, err = r.Read(b[offset:])
+		offset += n
+	}
+
+	return offset, err
 }
 
 // singlePart contains upload logic for uploading a single chunk via
@@ -511,7 +525,8 @@ func (u *multiuploader) upload(firstBuf io.ReadSeeker) (*UploadOutput, error) {
 	ch <- chunk{buf: firstBuf, num: num}
 
 	// Read and queue the rest of the parts
-	for u.geterr() == nil {
+	var err error
+	for u.geterr() == nil && err == nil {
 		num++
 		// This upload exceeded maximum number of supported parts, error now.
 		if num > int64(u.ctx.MaxUploadParts) || num > int64(MaxUploadParts) {
@@ -527,22 +542,26 @@ func (u *multiuploader) upload(firstBuf io.ReadSeeker) (*UploadOutput, error) {
 			break
 		}
 
-		buf, err := u.nextReader()
-		if err == io.EOF {
-			break
-		}
+		var reader io.ReadSeeker
+		var nextChunkLen int
+		reader, nextChunkLen, err = u.nextReader()
 
-		ch <- chunk{buf: buf, num: num}
-
-		if err == io.ErrUnexpectedEOF {
-			break
-		} else if err != nil {
+		if err != nil && err != io.EOF {
 			u.seterr(awserr.New(
 				"ReadRequestBody",
 				"read multipart upload data failed",
 				err))
 			break
 		}
+
+		if nextChunkLen == 0 {
+			// No need to upload empty part, if file was empty to start
+			// with empty single part would of been created and never
+			// started multipart upload.
+			break
+		}
+
+		ch <- chunk{buf: reader, num: num}
 	}
 
 	// Close the channel, wait for workers, and complete upload
@@ -589,11 +608,13 @@ func (u *multiuploader) readChunk(ch chan chunk) {
 // part information.
 func (u *multiuploader) send(c chunk) error {
 	req, resp := u.ctx.S3.UploadPartRequest(&s3.UploadPartInput{
-		Bucket:     u.in.Bucket,
-		Key:        u.in.Key,
-		Body:       c.buf,
-		UploadId:   &u.uploadID,
-		PartNumber: &c.num,
+		Bucket:               u.in.Bucket,
+		Key:                  u.in.Key,
+		Body:                 c.buf,
+		UploadId:             &u.uploadID,
+		SSECustomerAlgorithm: u.in.SSECustomerAlgorithm,
+		SSECustomerKey:       u.in.SSECustomerKey,
+		PartNumber:           &c.num,
 	})
 	req.Handlers.Build.PushBack(request.MakeAddToUserAgentFreeFormHandler("S3Manager"))
 	if err := req.Send(); err != nil {
